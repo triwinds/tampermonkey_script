@@ -1,0 +1,4 @@
+interface:
+  display_name: "GenericAgent Browser Control"
+  short_description: "Control a live Chromium tab through a local bridge."
+  default_prompt: "Use $genericagent-browser-control to inspect or operate the user's active Chromium tab through the local browser bridge."

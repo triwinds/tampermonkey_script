@@ -1,0 +1,67 @@
+# Python caches and compiled files
+__pycache__/
+*.py[cod]
+*.pyd
+.ipynb_checkpoints/
+
+# Local Python environments and dependency sandboxes
+.venv/
+venv/
+env/
+/.deps/
+
+# Test and coverage output
+.pytest_cache/
+.coverage
+.coverage.*
+coverage/
+htmlcov/
+.hypothesis/
+
+# Python tooling caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.tox/
+.nox/
+.cache/
+
+# Packaging and build output
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Node and frontend tooling
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.eslintcache
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Local scratch and research copies
+/.tmp/
+/.upstream/
+
+# Editor and OS files
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# Local bridge runtime logs
+*.log

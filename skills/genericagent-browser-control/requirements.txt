@@ -1,0 +1,4 @@
+beautifulsoup4>=4.12
+bottle>=0.12
+requests>=2.32
+simple-websocket-server>=0.4.4

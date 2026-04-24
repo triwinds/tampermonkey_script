@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body{width:420px;max-height:560px;margin:0;padding:12px;font:12px monospace;background:#1e1e1e;color:#d4d4d4;overflow-y:auto}
+h3{margin:0 0 8px;color:#569cd6}
+button{background:#264f78;color:#fff;border:none;padding:6px 12px;cursor:pointer;border-radius:3px}
+button:hover{background:#37699e}
+pre{white-space:pre-wrap;word-break:break-all;margin:0;padding:8px;background:#252526;border-radius:6px;max-height:320px;overflow-y:auto}
+.panel{background:#252526;border:1px solid #333;padding:10px;border-radius:8px;margin-bottom:10px}
+.row{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.label{font-size:13px;font-weight:bold;color:#e6e6e6}
+.hint{margin-top:4px;color:#9cdcfe;line-height:1.5}
+.status{margin-top:8px;color:#dcdcaa}
+.actions{display:flex;justify-content:flex-start;margin-bottom:8px}
+.toggle{position:relative;display:inline-flex;align-items:center;gap:10px;cursor:pointer}
+.toggle input{position:absolute;opacity:0;pointer-events:none}
+.track{position:relative;width:42px;height:24px;border-radius:999px;background:#5a5a5a;transition:background .2s ease}
+.track::after{content:'';position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform .2s ease}
+.toggle input:checked + .track{background:#4CAF50}
+.toggle input:checked + .track::after{transform:translateX(18px)}
+.toggle-text{color:#e6e6e6}
+</style>
+</head>
+<body>
+<div class="panel">
+	<h3>桥接状态</h3>
+	<div class="row">
+		<div>
+			<div class="label">允许外部控制</div>
+			<div class="hint">关闭后会拒绝页面桥接和本地 WebSocket 控制。</div>
+		</div>
+		<label class="toggle" for="allowExternalControl">
+			<input type="checkbox" id="allowExternalControl">
+			<span class="track"></span>
+			<span class="toggle-text" id="toggleText">已开启</span>
+		</label>
+	</div>
+	<div class="status" id="bridgeStatus">正在读取状态...</div>
+</div>
+
+<div class="panel">
+	<h3>Cookies</h3>
+	<div class="actions">
+		<button id="refresh">刷新</button>
+	</div>
+	<pre id="out">点击刷新获取 cookies...</pre>
+</div>
+<script src="cookie_utils.js"></script>
+<script src="config.js"></script>
+<script src="popup.js"></script>
+</body>
+</html>
