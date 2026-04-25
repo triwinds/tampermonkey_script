@@ -1,6 +1,6 @@
 ---
 name: genericagent-browser-control
-description: Use when Codex needs to control a live Chromium browser session through a local bridge for page scanning, DOM inspection, or JavaScript execution, especially when preserving the user's logged-in browser session matters.
+description: Use when Agent needs to control a live Chromium browser session through a local bridge for page scanning, DOM inspection, or JavaScript execution, especially when preserving the user's logged-in browser session matters.
 ---
 
 # GenericAgent Browser Control
