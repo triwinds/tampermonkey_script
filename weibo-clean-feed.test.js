@@ -10,6 +10,8 @@ const {
   cleanFeedWithRuntime,
   findRemovalTarget,
   cleanFeedWithScrollerRuntime,
+  repairDuplicateScrollerItems,
+  startCleaner,
 } = require('./weibo-clean-feed.user.js');
 
 const labelCases = [
@@ -53,6 +55,26 @@ const labelCases = [
       ariaLabels: [],
     },
     expected: true,
+  },
+  {
+    name: 'removes cards when editorial-picks badge is merged with header metadata text',
+    input: {
+      headerText: '大猪蹄子研究所 荐读 昨天 10:38',
+      tagTexts: ['荐读 昨天 10:38'],
+      titleTexts: [],
+      ariaLabels: [],
+    },
+    expected: true,
+  },
+  {
+    name: 'keeps normal cards when account names merely contain recommendation words',
+    input: {
+      headerText: '推荐电影君 昨天 10:38',
+      tagTexts: ['推荐电影君'],
+      titleTexts: [],
+      ariaLabels: [],
+    },
+    expected: false,
   },
 ];
 
@@ -289,6 +311,61 @@ assert.equal(
 }
 
 {
+  const forceUpdateCalls = [];
+  const items = [
+    { idstr: '1', text_raw: 'normal 1' },
+    { idstr: '2', text_raw: 'duplicated status' },
+    { idstr: '2', text_raw: 'duplicated status' },
+    { idstr: '3', text_raw: 'normal 3' },
+  ];
+
+  const removedCount = cleanFeedWithScrollerRuntime(
+    {
+      dynamicScroller: {
+        items,
+        forceUpdate(arg) {
+          forceUpdateCalls.push(arg);
+        },
+      },
+    },
+    {
+      querySelectorAll() {
+        return [];
+      },
+    },
+  );
+
+  assert.equal(removedCount, 1, 'removes duplicate non-ad items when the virtual scroller backing array drifts out of sync');
+  assert.deepEqual(items.map((item) => item.idstr), ['1', '2', '3'], 'keeps the first occurrence and removes later duplicate scroller entries by status id');
+  assert.deepEqual(forceUpdateCalls, [true], 'forces a virtual-scroller reflow after repairing duplicated scroller items');
+}
+
+{
+  const forceUpdateCalls = [];
+  const items = [
+    { idstr: '1', text_raw: 'normal 1' },
+    { idstr: '2', text_raw: 'duplicated status' },
+    { idstr: '2', text_raw: 'duplicated status' },
+    { idstr: '3', text_raw: 'normal 3' },
+  ];
+
+  const removedCount = repairDuplicateScrollerItems(
+    {
+      dynamicScroller: {
+        items,
+        forceUpdate(arg) {
+          forceUpdateCalls.push(arg);
+        },
+      },
+    },
+  );
+
+  assert.equal(removedCount, 1, 'repairs duplicate scroller entries directly without needing to run the full scroller cleanup');
+  assert.deepEqual(items.map((item) => item.idstr), ['1', '2', '3'], 'duplicate-only repair keeps the first occurrence and removes later duplicates by status id');
+  assert.deepEqual(forceUpdateCalls, [true], 'duplicate-only repair still forces a virtual-scroller reflow');
+}
+
+{
   const staleDynamicScroller = { items: [{ idstr: 'stale-1' }, { idstr: 'stale-2' }] };
   const correctDynamicScroller = { items: Array.from({ length: 27 }, (_, index) => ({ idstr: String(index + 1) })) };
   const recycleScroller = { handleScroll() {} };
@@ -451,4 +528,237 @@ assert.deepEqual(
   'replays Weibo runtime reporting endpoints before removing the ad item',
 );
 
-console.log('Passed 21 assertions.');
+{
+  const calls = [];
+  const currentStatuses = [
+    { idstr: '1', isAd: 0, text_raw: 'current normal' },
+  ];
+  const secondaryStatuses = [
+    {
+      idstr: '9',
+      isAd: 1,
+      text_raw: 'secondary ad',
+      mblog_menus_new: [
+        {
+          type: 'mblog_menus_hide_status',
+          name: '不感兴趣',
+          actionlog: { code: '50000003', mid: '9' },
+        },
+      ],
+      promotion: { type: 'ad' },
+      readtimetype: 'adMblog',
+    },
+  ];
+
+  const runtime = {
+    locationHref: 'https://weibo.com/mygroups?gid=current',
+    store: {
+      state: {
+        feed: {
+          latestList: {
+            current: {
+              statuses: currentStatuses,
+            },
+            secondary: {
+              statuses: secondaryStatuses,
+            },
+          },
+        },
+      },
+    },
+    http: {
+      post(url, payload) {
+        calls.push({ url, payload });
+        return Promise.resolve({ data: { ok: 1 } });
+      },
+    },
+  };
+
+  const removedCount = cleanFeedWithRuntime(runtime);
+
+  assert.equal(removedCount, 1, 'removes ads from any cached feed bucket instead of relying on a single guessed gid');
+  assert.deepEqual(
+    currentStatuses.map((status) => status.idstr),
+    ['1'],
+    'leaves unrelated current-bucket statuses untouched',
+  );
+  assert.deepEqual(
+    secondaryStatuses.map((status) => status.idstr),
+    [],
+    'removes blocked statuses from secondary cached buckets so the scroller cannot rehydrate them on the next pass',
+  );
+  assert.deepEqual(
+    calls,
+    [
+      {
+        url: '/ajax/feed/throwbatch',
+        payload: { actionlog: { code: '50000003', mid: '9' } },
+      },
+      {
+        url: '/ajax/feed/menuback',
+        payload: { menu_key: '1', mid: '9' },
+      },
+    ],
+    'reports hidden secondary-bucket ads through Weibo runtime before removing them from cache',
+  );
+}
+
+{
+  const listeners = new Map();
+  const observedTargets = [];
+  const observerCallbacks = [];
+  const timeoutCallbacks = [];
+  const cleanCalls = [];
+  const interactionRepairCalls = [];
+  const clearedTimeouts = [];
+  let expandedCommentsOpen = false;
+  const feedMutationTarget = {
+    nodeType: 1,
+    matches(selector) {
+      return selector.includes('.wbpro-scroller-item');
+    },
+    closest(selector) {
+      return selector.includes('.wbpro-scroller-item') ? this : null;
+    },
+  };
+  const doc = {
+    activeElement: null,
+    body: { nodeType: 1 },
+    querySelector(selector) {
+      if (expandedCommentsOpen && selector.includes('[aria-expanded="true"]')) {
+        return { selector };
+      }
+
+      return null;
+    },
+  };
+  const win = {
+    MutationObserver: class {
+      constructor(callback) {
+        observerCallbacks.push(callback);
+      }
+
+      observe(target, options) {
+        observedTargets.push({ target, options });
+      }
+    },
+    addEventListener(type, handler) {
+      listeners.set(type, handler);
+    },
+    setInterval(handler) {
+      throw new Error('setInterval should not be used when MutationObserver is available');
+    },
+    setTimeout(handler, delay) {
+      timeoutCallbacks.push({ handler, delay });
+      return timeoutCallbacks.length;
+    },
+    clearTimeout(timeoutId) {
+      clearedTimeouts.push(timeoutId);
+    },
+  };
+
+  const cleanerHandle = startCleaner(doc, 1000, win, () => {
+    cleanCalls.push('clean');
+  }, () => {
+    interactionRepairCalls.push('repair');
+    return 1;
+  });
+
+  assert.equal(cleanerHandle.intervalId, null, 'does not rely on the polling interval when MutationObserver is available');
+  assert.equal(Boolean(cleanerHandle.observer), true, 'installs a mutation observer to react to feed changes');
+  assert.equal(observedTargets.length, 1, 'starts observing the feed root for reactive cleanup triggers');
+  assert.deepEqual(cleanCalls, ['clean'], 'runs one initial clean immediately when the cleaner starts');
+  assert.equal(typeof listeners.get('wheel'), 'function', 'listens to wheel activity to avoid mutating the virtual list mid-scroll');
+  assert.equal(typeof listeners.get('scroll'), 'function', 'listens to scroll activity to defer list mutations until scrolling settles');
+  assert.equal(typeof listeners.get('pointerdown'), 'function', 'tracks pointer interactions so comment toggles can finish before feed mutations resume');
+  assert.equal(typeof listeners.get('click'), 'function', 'tracks click interactions such as opening comments before running deferred cleanup');
+
+  observerCallbacks[0]([
+    {
+      type: 'childList',
+      target: feedMutationTarget,
+      addedNodes: [feedMutationTarget],
+      removedNodes: [],
+    },
+  ]);
+
+  assert.deepEqual(cleanCalls, ['clean'], 'waits for mutation batches to settle before cleaning after feed changes');
+  assert.deepEqual(clearedTimeouts, [], 'does not clear a timer before the first scroll-idle debounce starts');
+  assert.equal(timeoutCallbacks[0].delay, 60, 'uses a short mutation-settle debounce before cleaning the updated feed');
+
+  timeoutCallbacks[0].handler();
+
+  assert.deepEqual(cleanCalls, ['clean', 'clean'], 'reactively cleans the feed after a relevant list mutation');
+
+  listeners.get('wheel')();
+  observerCallbacks[0]([
+    {
+      type: 'childList',
+      target: feedMutationTarget,
+      addedNodes: [feedMutationTarget],
+      removedNodes: [],
+    },
+  ]);
+
+  assert.equal(timeoutCallbacks[2].delay, 60, 'still debounces mutation-driven cleanups while the user is interacting');
+  timeoutCallbacks[2].handler();
+
+  assert.deepEqual(cleanCalls, ['clean', 'clean'], 'defers mutation-driven cleaning while scroll input is active');
+  assert.deepEqual(interactionRepairCalls, ['repair'], 'repairs duplicated scroller items even while scroll interaction is still active');
+  assert.deepEqual(clearedTimeouts, [], 'does not clear the interaction timer until another interaction event arrives');
+
+  listeners.get('scroll')();
+
+  assert.deepEqual(clearedTimeouts, [2], 'refreshes the idle debounce when scrolling continues');
+  timeoutCallbacks[3].handler();
+
+  assert.deepEqual(cleanCalls, ['clean', 'clean', 'clean'], 'runs the deferred mutation cleanup once scrolling becomes idle again');
+
+  listeners.get('click')();
+  observerCallbacks[0]([
+    {
+      type: 'childList',
+      target: feedMutationTarget,
+      addedNodes: [feedMutationTarget],
+      removedNodes: [],
+    },
+  ]);
+
+  assert.deepEqual(cleanCalls, ['clean', 'clean', 'clean'], 'defers mutation-driven cleaning while a click interaction such as opening comments is still settling');
+  assert.equal(timeoutCallbacks[4].delay, 900, 'uses a longer idle debounce for click-driven UI expansion like comments');
+  assert.equal(timeoutCallbacks[5].delay, 60, 'still debounces feed mutations before applying the deferred click-triggered cleanup');
+  timeoutCallbacks[5].handler();
+
+  assert.deepEqual(cleanCalls, ['clean', 'clean', 'clean'], 'does not run the deferred clean until the click interaction itself becomes idle');
+  assert.deepEqual(interactionRepairCalls, ['repair', 'repair'], 'keeps allowing duplicate-only repairs while click-driven interactions are active');
+  timeoutCallbacks[4].handler();
+
+  assert.deepEqual(cleanCalls, ['clean', 'clean', 'clean', 'clean'], 'runs the deferred clean after the click interaction becomes idle');
+
+  expandedCommentsOpen = true;
+  observerCallbacks[0]([
+    {
+      type: 'childList',
+      target: feedMutationTarget,
+      addedNodes: [feedMutationTarget],
+      removedNodes: [],
+    },
+  ]);
+
+  timeoutCallbacks[6].handler();
+
+  assert.deepEqual(cleanCalls, ['clean', 'clean', 'clean', 'clean'], 'keeps deferring cleanup while a comment section remains expanded after the click has already finished');
+  assert.deepEqual(interactionRepairCalls, ['repair', 'repair', 'repair'], 'runs duplicate-only repair when feed mutations land during an expanded comment interaction');
+  assert.equal(timeoutCallbacks[7].delay, 900, 're-arms the interaction idle timer when an expanded comment section is still open');
+  timeoutCallbacks[7].handler();
+
+  assert.deepEqual(cleanCalls, ['clean', 'clean', 'clean', 'clean'], 'does not resume cleanup just because the first idle timeout elapsed while comments are still open');
+  assert.deepEqual(interactionRepairCalls, ['repair', 'repair', 'repair', 'repair'], 'tries duplicate-only repair again while the comment interaction remains active');
+
+  expandedCommentsOpen = false;
+  timeoutCallbacks[8].handler();
+
+  assert.deepEqual(cleanCalls, ['clean', 'clean', 'clean', 'clean', 'clean'], 'runs the deferred cleanup only after the expanded comment section is closed');
+}
+
+console.log('Passed 54 assertions.');
