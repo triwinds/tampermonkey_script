@@ -1,63 +1,77 @@
 // ==UserScript==
-// @name         Weibo Feed Cleaner
+// @name         Weibo Feed Ad Cleaner
 // @namespace    https://tampermonkey.net/
-// @version      0.3.0
-// @description  Remove recommended / advertisement cards from the Weibo feed using Weibo's own feed runtime when available.
+// @version      0.2.0
+// @description  Remove ad cards from the Weibo PC feed by filtering feed API responses and cleaning Weibo's runtime fallback data.
 // @author       Codex
 // @match        https://weibo.com/*
 // @match        https://www.weibo.com/*
 // @grant        none
-// @run-at       document-idle
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const BLOCKED_LABELS = ['推荐', '广告', '\u8350\u8bfb'];
-  const SCAN_INTERVAL_MS = 1000;
-  const MUTATION_SETTLE_DELAY_MS = 60;
-  const SCROLL_IDLE_DELAY_MS = 180;
-  const INTERACTION_IDLE_DELAY_MS = 900;
+  const START_FLAG = '__weiboFeedAdCleanerController__';
+  const RESPONSE_HOOK_FLAG = '__weiboFeedAdCleanerResponseHooked__';
+  const SCROLLER_RUNTIME_FLAG = '__weiboFeedAdCleanerScrollerRuntime__';
+  const CLEAN_INTERVAL_MS = 1200;
+  const MUTATION_DEBOUNCE_MS = 80;
+  const INTERACTION_IDLE_MS = 260;
   const SCROLLER_REPAIR_DELAY_MS = 80;
   const SCROLLER_REPAIR_PASSES = 2;
-  const SCROLLER_RUNTIME_FLAG = '__weiboFeedCleanerScrollerRuntime__';
-  const SCROLLER_REPAIR_TIMER_FLAG = '__weiboFeedCleanerScrollerRepairTimer__';
-  const START_FLAG = '__weiboFeedCleanerIntervalId__';
   const FEED_CARD_SELECTOR = 'article.woo-panel-main';
-  const ACTIVE_FEED_INTERACTION_SELECTOR = [
-    `${FEED_CARD_SELECTOR} [aria-expanded="true"]`,
-    `${FEED_CARD_SELECTOR} [aria-pressed="true"]`,
-    `${FEED_CARD_SELECTOR} textarea`,
-    `${FEED_CARD_SELECTOR} input:not([type="hidden"])`,
-    `${FEED_CARD_SELECTOR} [contenteditable="true"]`,
-    `${FEED_CARD_SELECTOR} [role="textbox"]`,
+  const FEED_MUTATION_SELECTOR = [
+    FEED_CARD_SELECTOR,
+    '.wbpro-scroller-item',
+    '.vue-recycle-scroller__item-view',
   ].join(', ');
-  const FEED_MUTATION_SELECTOR = `${FEED_CARD_SELECTOR}, .wbpro-scroller-item, .vue-recycle-scroller__item-view`;
+  const BLOCKED_BADGES = ['广告'];
+  const FEED_API_RE = /\/ajax\/feed\//i;
+
+  // Keep this false by default: removing local feed items is enough, and server-side
+  // dislike feedback can alter the account's recommendation profile.
+  const SEND_WEIBO_FEEDBACK = false;
 
   function normalizeText(value) {
     return String(value ?? '').replace(/\s+/g, ' ').trim();
   }
 
-  function isLikelyHeaderMetaText(value) {
+  function summarizeText(value, maxLength = 80) {
     const text = normalizeText(value);
-    if (!text) {
-      return false;
-    }
-
-    return /^(刚刚|今天|昨天|前天|[0-9]{1,2}:[0-9]{2}|[0-9]+(?:分钟|小时|天|周|月|年)前|来自|已编辑|置顶|[0-9])/u.test(text);
+    return text.length <= maxLength ? text : `${text.slice(0, maxLength)}...`;
   }
 
-  function isBlockedLabelBoundaryChar(value = '') {
+  function summarizeUrl(value, maxLength = 180) {
+    if (!value) {
+      return '';
+    }
+
+    try {
+      const url = new URL(String(value), typeof location !== 'undefined' ? location.href : 'https://weibo.com/');
+      return summarizeText(`${url.pathname}${url.search}`, maxLength);
+    } catch (_) {
+      return summarizeText(value, maxLength);
+    }
+  }
+
+  function isLikelyHeaderMetaText(value) {
+    const text = normalizeText(value);
+    return /^(刚刚|今天|昨天|前天|[0-9]{1,2}:[0-9]{2}|[0-9]+(?:秒|分钟|小时|天|周|月|年)前|来自|已编辑|置顶|[0-9])/u.test(text);
+  }
+
+  function isBadgeBoundaryChar(value = '') {
     return !value || /[\s|｜/:：·•,【】()（）<>{}\[\]\-0-9]/u.test(value);
   }
 
-  function findBlockedLabel(value) {
+  function findBlockedBadge(value, labels = BLOCKED_BADGES) {
     const text = normalizeText(value);
     if (!text) {
       return '';
     }
 
-    for (const label of BLOCKED_LABELS) {
+    for (const label of labels) {
       if (text === label) {
         return label;
       }
@@ -66,53 +80,18 @@
         return label;
       }
 
-      let searchIndex = text.indexOf(label);
-      while (searchIndex !== -1) {
-        const before = text[searchIndex - 1] || '';
-        const after = text[searchIndex + label.length] || '';
-        if (isBlockedLabelBoundaryChar(before) && isBlockedLabelBoundaryChar(after)) {
+      let index = text.indexOf(label);
+      while (index !== -1) {
+        const before = text[index - 1] || '';
+        const after = text[index + label.length] || '';
+        if (isBadgeBoundaryChar(before) && isBadgeBoundaryChar(after)) {
           return label;
         }
-
-        searchIndex = text.indexOf(label, searchIndex + label.length);
+        index = text.indexOf(label, index + label.length);
       }
     }
 
     return '';
-  }
-
-  function summarizeText(value, maxLength = 80) {
-    const text = normalizeText(value);
-    if (text.length <= maxLength) {
-      return text;
-    }
-
-    return `${text.slice(0, maxLength)}...`;
-  }
-
-  function logCardRemoval(source, details = {}) {
-    if (typeof console === 'undefined' || typeof console.info !== 'function') {
-      return;
-    }
-
-    console.info('[weibo-clean-feed] removed card', {
-      source,
-      ...details,
-    });
-  }
-
-  function hasBlockedLabel(values) {
-    return values.some((value) => Boolean(findBlockedLabel(value)));
-  }
-
-  function shouldRemoveCardBySignals(signals = {}) {
-    if (findBlockedLabel(signals.headerText)) {
-      return true;
-    }
-
-    return hasBlockedLabel(signals.tagTexts || [])
-      || hasBlockedLabel(signals.titleTexts || [])
-      || hasBlockedLabel(signals.ariaLabels || []);
   }
 
   function collectTextContent(nodes) {
@@ -124,28 +103,33 @@
   }
 
   function collectCardSignals(card) {
-    const header = card.querySelector('header') || card;
+    const header = card?.querySelector?.('header') || card;
+    if (!header) {
+      return {
+        headerText: '',
+        tagTexts: [],
+        titleTexts: [],
+        ariaLabels: [],
+      };
+    }
 
     return {
       headerText: normalizeText(header.textContent),
-      tagTexts: collectTextContent(header.querySelectorAll('*')),
-      titleTexts: collectAttribute(header.querySelectorAll('[title]'), 'title'),
-      ariaLabels: collectAttribute(header.querySelectorAll('[aria-label]'), 'aria-label'),
+      tagTexts: collectTextContent(header.querySelectorAll?.('*')),
+      titleTexts: collectAttribute(header.querySelectorAll?.('[title]'), 'title'),
+      ariaLabels: collectAttribute(header.querySelectorAll?.('[aria-label]'), 'aria-label'),
     };
   }
 
-  function summarizeCard(card) {
-    const signals = collectCardSignals(card);
-    return {
-      headerText: summarizeText(signals.headerText),
-      matchedLabel: findBlockedLabel(signals.headerText)
-        || signals.tagTexts.map((value) => findBlockedLabel(value)).find(Boolean)
-        || signals.titleTexts.map((value) => findBlockedLabel(value)).find(Boolean)
-        || signals.ariaLabels.map((value) => findBlockedLabel(value)).find(Boolean)
-        || '',
-      itemIndex: getScrollerItemIndex(card),
-      preview: summarizeText(card?.innerText || card?.textContent || ''),
-    };
+  function hasBlockedBadge(values) {
+    return values.some((value) => Boolean(findBlockedBadge(value)));
+  }
+
+  function shouldRemoveCardBySignals(signals = {}) {
+    return Boolean(findBlockedBadge(signals.headerText))
+      || hasBlockedBadge(signals.tagTexts || [])
+      || hasBlockedBadge(signals.titleTexts || [])
+      || hasBlockedBadge(signals.ariaLabels || []);
   }
 
   function shouldRemoveCard(card) {
@@ -153,18 +137,18 @@
   }
 
   function getVueApp(doc = document) {
-    return doc.querySelector('#app')?.__vue_app__
+    return doc.querySelector?.('#app')?.__vue_app__
       || doc.body?.__vue_app__
       || null;
   }
 
   function getWeiboRuntime(doc = document, win = window) {
     const app = getVueApp(doc);
-    const globalProperties = app?._context?.config?.globalProperties;
-    const store = globalProperties?.$store;
-    const http = globalProperties?.$http;
+    const globalProperties = app?._context?.config?.globalProperties || null;
+    const store = globalProperties?.$store || null;
+    const http = globalProperties?.$http || null;
 
-    if (!app || !store || !http) {
+    if (!app || !store) {
       return null;
     }
 
@@ -174,42 +158,8 @@
       http,
       locationHref: win?.location?.href || '',
       store,
-      toast: globalProperties?.$_w_toast,
       win,
     };
-  }
-
-  function resolveCurrentGroupId(locationHref = '', latestList = {}, feedState = {}) {
-    try {
-      const gid = new URL(locationHref).searchParams.get('gid');
-      if (gid && latestList[gid]) {
-        return gid;
-      }
-      if (gid) {
-        return gid;
-      }
-    } catch {
-      // Ignore URL parsing failures and fall back to store state.
-    }
-
-    const candidates = [
-      feedState?.feedGroup?.gid,
-      feedState?.curTab?.gid,
-      typeof feedState?.curTab === 'string' ? feedState.curTab : null,
-    ].filter(Boolean);
-
-    for (const candidate of candidates) {
-      if (latestList[candidate]) {
-        return candidate;
-      }
-    }
-
-    return Object.keys(latestList)[0] || null;
-  }
-
-  function getStatusesBucket(feedState, groupId) {
-    const bucket = feedState?.latestList?.[groupId];
-    return Array.isArray(bucket?.statuses) ? bucket : null;
   }
 
   function collectFeedStatusLists(feedState = {}) {
@@ -219,37 +169,296 @@
     }
 
     const seen = new Set();
-    const statusLists = [];
-
+    const lists = [];
     for (const bucket of Object.values(latestList)) {
       if (!Array.isArray(bucket?.statuses) || seen.has(bucket.statuses)) {
         continue;
       }
-
       seen.add(bucket.statuses);
-      statusLists.push(bucket.statuses);
+      lists.push(bucket.statuses);
     }
-
-    return statusLists;
+    return lists;
   }
 
   function isBlockedStatus(status = {}) {
-    return Boolean(
-      status
-      && typeof status === 'object'
-      && (
-        status.isAd === 1
-        || status.isAd === true
-        || normalizeText(status.mark).includes('reallog_mark_ad')
-        || status.promotion?.type === 'ad'
-        || status.readtimetype === 'adMblog'
-      )
-    );
+    if (!status || typeof status !== 'object') {
+      return false;
+    }
+
+    const mark = normalizeText(status.mark);
+    const promotionType = normalizeText(status.promotion?.type).toLowerCase();
+    const readTimeType = normalizeText(status.readtimetype).toLowerCase();
+
+    return status.isAd === 1
+      || status.isAd === true
+      || mark.includes('reallog_mark_ad')
+      || promotionType === 'ad'
+      || readTimeType === 'admblog';
+  }
+
+  function isWeiboHost(hostname = '') {
+    return /(^|\.)weibo\.com$/i.test(hostname);
+  }
+
+  function isFeedApiUrl(value, baseHref = typeof location !== 'undefined' ? location.href : 'https://weibo.com/') {
+    if (typeof value !== 'string' && !(value instanceof URL)) {
+      return false;
+    }
+
+    try {
+      const url = new URL(String(value), baseHref);
+      return isWeiboHost(url.hostname) && FEED_API_RE.test(url.pathname);
+    } catch (_) {
+      return FEED_API_RE.test(String(value));
+    }
+  }
+
+  function hasAdPayloadHint(text) {
+    return typeof text === 'string'
+      && /"isAd"\s*:\s*(?:1|true)|reallog_mark_ad|"readtimetype"\s*:\s*"adMblog"|"promotion"\s*:/i.test(text);
+  }
+
+  function sanitizeFeedJsonValue(value, options = {}, seen = new WeakSet()) {
+    if (options instanceof WeakSet) {
+      seen = options;
+      options = {};
+    }
+    if (!options || typeof options !== 'object') {
+      options = {};
+    }
+
+    if (!value || typeof value !== 'object') {
+      return 0;
+    }
+
+    if (seen.has(value)) {
+      return 0;
+    }
+    seen.add(value);
+
+    let removedCount = 0;
+
+    if (Array.isArray(value)) {
+      for (let index = value.length - 1; index >= 0; index -= 1) {
+        const item = value[index];
+        if (isBlockedStatus(item)) {
+          if (options.log !== false) {
+            logRemoval(options.source || 'api', {
+              apiUrl: summarizeUrl(options.url),
+              index,
+              ...summarizeStatus(item),
+            });
+          }
+          value.splice(index, 1);
+          removedCount += 1;
+          continue;
+        }
+        removedCount += sanitizeFeedJsonValue(item, options, seen);
+      }
+      return removedCount;
+    }
+
+    for (const key of Object.keys(value)) {
+      removedCount += sanitizeFeedJsonValue(value[key], options, seen);
+    }
+    return removedCount;
+  }
+
+  function sanitizeFeedResponseText(text, options = {}) {
+    if (typeof text !== 'string' || !hasAdPayloadHint(text)) {
+      return text;
+    }
+
+    try {
+      const payload = JSON.parse(text);
+      const removedCount = sanitizeFeedJsonValue(payload, options);
+      return removedCount > 0 ? JSON.stringify(payload) : text;
+    } catch (_) {
+      return text;
+    }
+  }
+
+  function findPropertyDescriptor(target, propertyName) {
+    let current = target;
+    while (current) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, propertyName);
+      if (descriptor) {
+        return descriptor;
+      }
+      current = Object.getPrototypeOf(current);
+    }
+    return null;
+  }
+
+  function installFetchHook(win = window) {
+    if (!win || typeof win.fetch !== 'function') {
+      return false;
+    }
+
+    const nativeFetch = win.fetch;
+    win.fetch = function patchedFetch(input, init) {
+      const requestedUrl = typeof input === 'string' || input instanceof URL
+        ? String(input)
+        : input?.url || '';
+
+      return nativeFetch.call(this, input, init).then((response) => {
+        if (!isFeedApiUrl(requestedUrl || response?.url || '', win.location?.href)) {
+          return response;
+        }
+
+        return response.clone().text().then((text) => {
+          const sanitized = sanitizeFeedResponseText(text, {
+            source: 'api',
+            url: requestedUrl || response?.url || '',
+          });
+          if (sanitized === text) {
+            return response;
+          }
+
+          const headers = new Headers(response.headers);
+          headers.delete('content-length');
+          headers.delete('content-encoding');
+          return new Response(sanitized, {
+            status: response.status,
+            statusText: response.statusText,
+            headers,
+          });
+        }).catch(() => response);
+      });
+    };
+
+    return true;
+  }
+
+  function installXMLHttpRequestHook(win = window) {
+    const XHR = win?.XMLHttpRequest;
+    if (typeof XHR !== 'function' || !XHR.prototype) {
+      return false;
+    }
+
+    const metadata = new WeakMap();
+    const nativeOpen = XHR.prototype.open;
+    const responseTextDescriptor = findPropertyDescriptor(XHR.prototype, 'responseText');
+    const responseDescriptor = findPropertyDescriptor(XHR.prototype, 'response');
+
+    XHR.prototype.open = function patchedOpen(method, url, ...rest) {
+      metadata.set(this, {
+        rawText: null,
+        sanitizedText: null,
+        url: String(url || ''),
+      });
+      return nativeOpen.call(this, method, url, ...rest);
+    };
+
+    function shouldSanitizeRequest(xhr) {
+      const meta = metadata.get(xhr);
+      return Boolean(meta)
+        && xhr.readyState === 4
+        && isFeedApiUrl(meta.url, win.location?.href);
+    }
+
+    function getSanitizedText(xhr) {
+      const text = responseTextDescriptor?.get?.call(xhr);
+      if (!shouldSanitizeRequest(xhr) || typeof text !== 'string') {
+        return text;
+      }
+
+      const meta = metadata.get(xhr);
+      if (meta.rawText === text) {
+        return meta.sanitizedText;
+      }
+
+      const sanitized = sanitizeFeedResponseText(text, {
+        source: 'api',
+        url: meta.url,
+      });
+      meta.rawText = text;
+      meta.sanitizedText = sanitized;
+      return sanitized;
+    }
+
+    let patchedAnyDescriptor = false;
+    if (responseTextDescriptor?.get) {
+      try {
+        Object.defineProperty(XHR.prototype, 'responseText', {
+          configurable: true,
+          enumerable: responseTextDescriptor.enumerable,
+          get() {
+            return getSanitizedText(this);
+          },
+        });
+        patchedAnyDescriptor = true;
+      } catch (_) {
+        // Some engines expose XHR response accessors as non-configurable.
+      }
+    }
+
+    if (responseDescriptor?.get) {
+      try {
+        Object.defineProperty(XHR.prototype, 'response', {
+          configurable: true,
+          enumerable: responseDescriptor.enumerable,
+          get() {
+            const responseType = this.responseType || '';
+            if (!shouldSanitizeRequest(this)) {
+              return responseDescriptor.get.call(this);
+            }
+
+            if (responseType === '' || responseType === 'text') {
+              return getSanitizedText(this);
+            }
+
+            const responseValue = responseDescriptor.get.call(this);
+            if (responseType === 'json' && responseValue && typeof responseValue === 'object') {
+              sanitizeFeedJsonValue(responseValue, {
+                source: 'api',
+                url: metadata.get(this)?.url || '',
+              });
+            }
+            return responseValue;
+          },
+        });
+        patchedAnyDescriptor = true;
+      } catch (_) {
+        // Leave the runtime fallback in place when descriptor patching is blocked.
+      }
+    }
+
+    return patchedAnyDescriptor;
+  }
+
+  function installResponseHooks(win = window) {
+    if (!win || win[RESPONSE_HOOK_FLAG]) {
+      return [];
+    }
+
+    try {
+      Object.defineProperty(win, RESPONSE_HOOK_FLAG, {
+        configurable: false,
+        enumerable: false,
+        value: true,
+        writable: false,
+      });
+    } catch (_) {
+      win[RESPONSE_HOOK_FLAG] = true;
+    }
+
+    return [
+      installXMLHttpRequestHook(win) && 'XMLHttpRequest',
+      installFetchHook(win) && 'fetch',
+    ].filter(Boolean);
+  }
+
+  function getStatusId(status = {}) {
+    return String(status.idstr || status.id || status.mid || '');
+  }
+
+  function getStatusDedupKey(status = {}) {
+    return getStatusId(status) || status;
   }
 
   function findHideStatusMenu(status = {}) {
     const menus = Array.isArray(status.mblog_menus_new) ? status.mblog_menus_new : [];
-
     return menus.find((menu) => menu?.type === 'mblog_menus_hide_status' && menu?.name === '不感兴趣')
       || menus.find((menu) => menu?.type === 'mblog_menus_hide_status' && menu?.name === '屏蔽此博主')
       || menus.find((menu) => menu?.type === 'mblog_menus_hide_status')
@@ -260,24 +469,10 @@
     if (menu.name === '不感兴趣') {
       return '1';
     }
-
     if (menu.name === '屏蔽此博主') {
       return '2';
     }
-
     return normalizeText(menu.need_back);
-  }
-
-  function getStatusId(status = {}) {
-    return String(status.idstr || status.id || '');
-  }
-
-  function getStatusDedupKey(status = {}) {
-    return getStatusId(status) || status;
-  }
-
-  function getPreferredActionlog(status = {}, menu = null) {
-    return menu?.actionlog || status.extra_button_info?.actionlog || null;
   }
 
   function safePost(http, url, payload) {
@@ -291,82 +486,90 @@
         request.catch(() => {});
       }
       return true;
-    } catch {
+    } catch (_) {
       return false;
     }
   }
 
-  function reportStatusHidden(runtime, status, menu) {
-    const id = getStatusId(status);
-    const actionlog = getPreferredActionlog(status, menu);
+  function reportStatusHidden(runtime, status, menu = findHideStatusMenu(status)) {
+    if (!SEND_WEIBO_FEEDBACK || !runtime?.http) {
+      return false;
+    }
 
+    const id = getStatusId(status);
+    const actionlog = menu?.actionlog || status?.extra_button_info?.actionlog || null;
     if (actionlog) {
       safePost(runtime.http, '/ajax/feed/throwbatch', { actionlog });
     }
 
-    const menuKey = getMenuBackKey(menu);
+    const menuKey = getMenuBackKey(menu || {});
     if (menuKey && id) {
       safePost(runtime.http, '/ajax/feed/menuback', {
         menu_key: menuKey,
         mid: id,
       });
     }
+
+    return true;
+  }
+
+  function logRemoval(source, details = {}) {
+    if (typeof console === 'undefined' || typeof console.info !== 'function') {
+      return;
+    }
+
+    console.info(`[weibo-feed-ad-cleaner][${source}] removed ad card`, {
+      source,
+      ...details,
+    });
   }
 
   function summarizeStatus(status = {}) {
     return {
       id: getStatusId(status),
-      user: status?.user?.screen_name || '',
-      mark: normalizeText(status?.mark),
-      readtimetype: normalizeText(status?.readtimetype),
-      text: summarizeText(status?.text_raw || status?.text || ''),
+      isAd: status.isAd,
+      mark: summarizeText(status.mark, 80),
+      promotionType: normalizeText(status.promotion?.type),
+      readtimetype: normalizeText(status.readtimetype),
     };
   }
 
-  function removeStatusFromList(statuses, statusId) {
-    const index = statuses.findIndex((status) => getStatusId(status) === String(statusId));
-    if (index === -1) {
-      return false;
-    }
-
-    statuses.splice(index, 1);
-    return true;
-  }
-
-  function cleanFeedWithRuntime(runtime, removedStatusIds = null) {
-    if (!runtime?.store?.state?.feed?.latestList) {
-      return 0;
-    }
-
-    const feedState = runtime.store.state.feed;
-    const statusLists = collectFeedStatusLists(feedState);
-    if (statusLists.length === 0) {
+  function cleanStatusArray(statuses, runtime = null, removedStatusIds = new Set(), source = 'runtime') {
+    if (!Array.isArray(statuses)) {
       return 0;
     }
 
     let removedCount = 0;
-    const seenRemovals = removedStatusIds || new Set();
-
-    for (const statuses of statusLists) {
-      for (let index = statuses.length - 1; index >= 0; index -= 1) {
-        const status = statuses[index];
-        if (!isBlockedStatus(status)) {
-          continue;
-        }
-
-        statuses.splice(index, 1);
-
-        const dedupKey = getStatusDedupKey(status);
-        if (seenRemovals.has(dedupKey)) {
-          continue;
-        }
-
-        seenRemovals.add(dedupKey);
-        const menu = findHideStatusMenu(status);
-        reportStatusHidden(runtime, status, menu);
-        logCardRemoval('runtime', summarizeStatus(status));
-        removedCount += 1;
+    for (let index = statuses.length - 1; index >= 0; index -= 1) {
+      const status = statuses[index];
+      if (!isBlockedStatus(status)) {
+        continue;
       }
+
+      statuses.splice(index, 1);
+      removedCount += 1;
+
+      const dedupKey = getStatusDedupKey(status);
+      if (!removedStatusIds.has(dedupKey)) {
+        removedStatusIds.add(dedupKey);
+        reportStatusHidden(runtime, status);
+        logRemoval(source, {
+          index,
+          ...summarizeStatus(status),
+        });
+      }
+    }
+
+    return removedCount;
+  }
+
+  function cleanFeedWithRuntime(runtime, removedStatusIds = new Set()) {
+    const feedState = runtime?.store?.state?.feed;
+    const lists = collectFeedStatusLists(feedState);
+    let removedCount = 0;
+
+    for (const statuses of lists) {
+      removedCount += cleanStatusArray(statuses, runtime, removedStatusIds, 'runtime');
     }
 
     return removedCount;
@@ -378,9 +581,7 @@
     }
 
     if (Array.isArray(vnode)) {
-      for (const child of vnode) {
-        enqueueVueComponentChildren(queue, child);
-      }
+      vnode.forEach((child) => enqueueVueComponentChildren(queue, child));
       return;
     }
 
@@ -389,76 +590,28 @@
     }
 
     if (Array.isArray(vnode.children)) {
-      for (const child of vnode.children) {
-        enqueueVueComponentChildren(queue, child);
-      }
+      vnode.children.forEach((child) => enqueueVueComponentChildren(queue, child));
     }
 
     if (Array.isArray(vnode.dynamicChildren)) {
-      for (const child of vnode.dynamicChildren) {
-        enqueueVueComponentChildren(queue, child);
-      }
+      vnode.dynamicChildren.forEach((child) => enqueueVueComponentChildren(queue, child));
     }
 
     if (vnode.suspense?.activeBranch) {
       enqueueVueComponentChildren(queue, vnode.suspense.activeBranch);
     }
-
-    if (vnode.ssContent) {
-      enqueueVueComponentChildren(queue, vnode.ssContent);
-    }
-
-    if (vnode.ssFallback) {
-      enqueueVueComponentChildren(queue, vnode.ssFallback);
-    }
   }
 
   function getVisibleScrollerMetrics(root = document) {
-    if (!root || typeof root.querySelectorAll !== 'function') {
-      return { maxIndex: null, visibleCount: 0 };
-    }
+    const indexes = Array.from(root?.querySelectorAll?.('.wbpro-scroller-item') || [], (item) => {
+      const index = Number.parseInt(item?.dataset?.index ?? '', 10);
+      return Number.isInteger(index) ? index : null;
+    }).filter((index) => index !== null);
 
-    let maxIndex = null;
-    let visibleCount = 0;
-    const items = root.querySelectorAll('.wbpro-scroller-item');
-
-    for (const item of items) {
-      visibleCount += 1;
-      const rawIndex = item?.dataset?.index ?? '';
-      const index = Number.parseInt(rawIndex, 10);
-      if (!Number.isInteger(index)) {
-        continue;
-      }
-
-      if (maxIndex === null || index > maxIndex) {
-        maxIndex = index;
-      }
-    }
-
-    return { maxIndex, visibleCount };
-  }
-
-  function getScrollerItemsLength(scroller) {
-    return Array.isArray(scroller?.items) ? scroller.items.length : 0;
-  }
-
-  function isUsableScrollerRuntime(runtime, root = document) {
-    if (!Array.isArray(runtime?.dynamicScroller?.items)) {
-      return false;
-    }
-
-    const { maxIndex, visibleCount } = getVisibleScrollerMetrics(root);
-    const itemsLength = runtime.dynamicScroller.items.length;
-
-    if (maxIndex !== null && itemsLength <= maxIndex) {
-      return false;
-    }
-
-    if (visibleCount > 0 && itemsLength < visibleCount) {
-      return false;
-    }
-
-    return true;
+    return {
+      visibleCount: indexes.length,
+      maxIndex: indexes.length ? Math.max(...indexes) : null,
+    };
   }
 
   function pickBestDynamicScroller(scrollers, root = document) {
@@ -467,23 +620,27 @@
       return null;
     }
 
-    const { maxIndex, visibleCount } = getVisibleScrollerMetrics(root);
+    const { visibleCount, maxIndex } = getVisibleScrollerMetrics(root);
     const minimumLength = Math.max(visibleCount, maxIndex === null ? 0 : maxIndex + 1);
-    const validCandidates = candidates.filter((scroller) => scroller.items.length >= minimumLength);
-    const pool = validCandidates.length > 0 ? validCandidates : candidates;
+    const valid = candidates.filter((scroller) => scroller.items.length >= minimumLength);
+    const pool = valid.length ? valid : candidates;
 
     return pool.reduce((best, scroller) => {
-      if (!best || getScrollerItemsLength(scroller) > getScrollerItemsLength(best)) {
+      if (!best || scroller.items.length > best.items.length) {
         return scroller;
       }
-
       return best;
     }, null);
   }
 
   function getFeedScrollerRuntime(doc = document, win = window) {
     const cached = win?.[SCROLLER_RUNTIME_FLAG];
-    if (isUsableScrollerRuntime(cached, doc)) {
+    const { visibleCount, maxIndex } = getVisibleScrollerMetrics(doc);
+    if (
+      Array.isArray(cached?.dynamicScroller?.items)
+      && cached.dynamicScroller.items.length >= visibleCount
+      && (maxIndex === null || cached.dynamicScroller.items.length > maxIndex)
+    ) {
       return cached;
     }
 
@@ -517,15 +674,8 @@
 
     const dynamicScroller = pickBestDynamicScroller(dynamicScrollerCandidates, doc);
     const recycleScroller = recycleScrollerCandidates.find((scroller) => typeof scroller?.handleScroll === 'function') || null;
+    const runtime = dynamicScroller || recycleScroller ? { dynamicScroller, recycleScroller } : null;
 
-    if (!dynamicScroller && !recycleScroller) {
-      if (win) {
-        win[SCROLLER_RUNTIME_FLAG] = null;
-      }
-      return null;
-    }
-
-    const runtime = { dynamicScroller, recycleScroller };
     if (win) {
       win[SCROLLER_RUNTIME_FLAG] = runtime;
     }
@@ -537,10 +687,16 @@
       return null;
     }
 
-    const item = card?.closest?.('.wbpro-scroller-item');
-    const rawIndex = item?.dataset?.index ?? '';
-    const index = Number.parseInt(rawIndex, 10);
+    const item = card.closest('.wbpro-scroller-item');
+    const index = Number.parseInt(item?.dataset?.index ?? '', 10);
     return Number.isInteger(index) ? index : null;
+  }
+
+  function collectBadgeMatchedScrollerIndexes(root = document) {
+    return Array.from(root?.querySelectorAll?.(FEED_CARD_SELECTOR) || [])
+      .filter((card) => shouldRemoveCard(card))
+      .map((card) => getScrollerItemIndex(card))
+      .filter((index) => Number.isInteger(index));
   }
 
   function collectScrollerItemProxies(scrollerRuntime) {
@@ -552,7 +708,6 @@
     const seen = new Set();
     const queue = [rootComponent];
     const items = [];
-
     while (queue.length) {
       const component = queue.shift();
       if (!component || seen.has(component)) {
@@ -564,21 +719,17 @@
       if (componentName === 'DynamicScrollerItem' && component.proxy) {
         items.push(component.proxy);
       }
-
       enqueueVueComponentChildren(queue, component.subTree);
     }
-
     return items;
   }
 
   function repairScrollerItemSizes(scrollerRuntime) {
     let repairedCount = 0;
-
     for (const item of collectScrollerItemProxies(scrollerRuntime)) {
       if (item?.finalActive === false || typeof item?.updateSize !== 'function') {
         continue;
       }
-
       item.updateSize();
       repairedCount += 1;
     }
@@ -586,225 +737,111 @@
     if (repairedCount > 0) {
       scrollerRuntime?.recycleScroller?.handleScroll?.();
     }
-
     return repairedCount;
   }
 
-  function scheduleScrollerItemSizeRepair(scrollerRuntime, win = typeof window !== 'undefined' ? window : null) {
+  function scheduleScrollerRepair(scrollerRuntime, win = window) {
     if (!scrollerRuntime || !win || typeof win.setTimeout !== 'function') {
       return 0;
     }
 
-    const previousTimer = win[SCROLLER_REPAIR_TIMER_FLAG];
-    if (previousTimer && typeof win.clearTimeout === 'function') {
-      win.clearTimeout(previousTimer);
-    }
-
-    let remainingPasses = SCROLLER_REPAIR_PASSES;
+    let remaining = SCROLLER_REPAIR_PASSES;
     const runPass = () => {
       repairScrollerItemSizes(scrollerRuntime);
-      remainingPasses -= 1;
-
-      if (remainingPasses > 0) {
-        win[SCROLLER_REPAIR_TIMER_FLAG] = win.setTimeout(runPass, SCROLLER_REPAIR_DELAY_MS);
-        return;
+      remaining -= 1;
+      if (remaining > 0) {
+        win.setTimeout(runPass, SCROLLER_REPAIR_DELAY_MS);
       }
-
-      win[SCROLLER_REPAIR_TIMER_FLAG] = null;
     };
 
-    win[SCROLLER_REPAIR_TIMER_FLAG] = win.setTimeout(runPass, SCROLLER_REPAIR_DELAY_MS);
+    win.setTimeout(runPass, SCROLLER_REPAIR_DELAY_MS);
     return SCROLLER_REPAIR_PASSES;
   }
 
-  function collectDuplicateScrollerIndexes(items = []) {
-    const seenStatusIds = new Set();
-    const duplicateIndexes = [];
-
-    for (let index = 0; index < items.length; index += 1) {
-      const statusId = getStatusId(items[index]);
-      if (!statusId) {
-        continue;
-      }
-
-      if (seenStatusIds.has(statusId)) {
-        duplicateIndexes.push(index);
-        continue;
-      }
-
-      seenStatusIds.add(statusId);
-    }
-
-    return duplicateIndexes;
-  }
-
-  function repairDuplicateScrollerItems(
-    runtime,
-    win = typeof window !== 'undefined' ? window : null,
-    removedStatusIds = null,
-  ) {
-    const items = runtime?.dynamicScroller?.items;
+  function cleanFeedWithScrollerRuntime(scrollerRuntime, root = document, runtime = null, removedStatusIds = new Set(), win = window) {
+    const items = scrollerRuntime?.dynamicScroller?.items;
     if (!Array.isArray(items)) {
       return 0;
     }
 
-    const duplicateIndexes = collectDuplicateScrollerIndexes(items)
-      .filter((index) => index >= 0 && index < items.length)
-      .sort((left, right) => right - left);
-
-    if (duplicateIndexes.length === 0) {
-      return 0;
-    }
-
-    for (const index of duplicateIndexes) {
-      const item = items[index];
-      items.splice(index, 1);
-      const dedupKey = getStatusDedupKey(item);
-      if (!removedStatusIds || !removedStatusIds.has(dedupKey)) {
-        logCardRemoval('scroller', {
-          index,
-          id: getStatusId(item),
-          text: summarizeText(item?.text_raw || item?.text || ''),
-          mark: normalizeText(item?.mark),
-          reason: 'duplicate',
-        });
-
-        if (removedStatusIds) {
-          removedStatusIds.add(dedupKey);
-        }
-      }
-    }
-
-    runtime.dynamicScroller.forceUpdate?.(true);
-    scheduleScrollerItemSizeRepair(runtime, win);
-    return duplicateIndexes.length;
-  }
-
-  function cleanFeedWithScrollerRuntime(
-    runtime,
-    root = document,
-    win = typeof window !== 'undefined' ? window : null,
-    removedStatusIds = null,
-  ) {
-    if (!root || typeof root.querySelectorAll !== 'function') {
-      return 0;
-    }
-
-    const items = runtime?.dynamicScroller?.items;
-    if (!Array.isArray(items)) {
-      return 0;
-    }
-
-    const duplicateIndexes = new Set(collectDuplicateScrollerIndexes(items));
-    const blockedIndexes = new Set();
-    for (const duplicateIndex of duplicateIndexes) {
-      blockedIndexes.add(duplicateIndex);
-    }
-
-    const cards = root.querySelectorAll('article.woo-panel-main');
-
-    for (const card of cards) {
-      const index = getScrollerItemIndex(card);
-      if (index === null || !shouldRemoveCard(card)) {
-        continue;
-      }
-
-      blockedIndexes.add(index);
-    }
-
+    const indexes = new Set();
     for (let index = 0; index < items.length; index += 1) {
       if (isBlockedStatus(items[index])) {
-        blockedIndexes.add(index);
+        indexes.add(index);
       }
     }
 
-    const indexes = Array.from(blockedIndexes)
+    for (const index of collectBadgeMatchedScrollerIndexes(root)) {
+      indexes.add(index);
+    }
+
+    const sortedIndexes = Array.from(indexes)
       .filter((index) => index >= 0 && index < items.length)
       .sort((left, right) => right - left);
 
-    if (indexes.length === 0) {
+    if (sortedIndexes.length === 0) {
       return 0;
     }
 
-    for (const index of indexes) {
-      const item = items[index];
+    for (const index of sortedIndexes) {
+      const status = items[index];
       items.splice(index, 1);
-      const dedupKey = getStatusDedupKey(item);
-      if (!removedStatusIds || !removedStatusIds.has(dedupKey)) {
-        logCardRemoval('scroller', {
-          index,
-          id: getStatusId(item),
-          text: summarizeText(item?.text_raw || item?.text || ''),
-          mark: normalizeText(item?.mark),
-          reason: duplicateIndexes.has(index) ? 'duplicate' : 'runtime-or-dom-match',
-        });
 
-        if (removedStatusIds) {
-          removedStatusIds.add(dedupKey);
-        }
+      const dedupKey = getStatusDedupKey(status);
+      if (!removedStatusIds.has(dedupKey)) {
+        removedStatusIds.add(dedupKey);
+        reportStatusHidden(runtime, status);
+        logRemoval('scroller', {
+          index,
+          ...summarizeStatus(status),
+        });
       }
     }
 
-    runtime.dynamicScroller.forceUpdate?.(true);
-    scheduleScrollerItemSizeRepair(runtime, win);
-    return indexes.length;
+    scrollerRuntime.dynamicScroller.forceUpdate?.(true);
+    scrollerRuntime.recycleScroller?.handleScroll?.();
+    scheduleScrollerRepair(scrollerRuntime, win);
+    return sortedIndexes.length;
   }
 
   function findRemovalTarget(card) {
-    if (card.closest('.vue-recycle-scroller__item-view')) {
+    if (card.closest?.('.vue-recycle-scroller__item-view')) {
       return null;
     }
 
-    return card.closest('.wbpro-scroller-item')
-      || card;
+    return card.closest?.('.wbpro-scroller-item') || card;
   }
 
   function cleanFeedByDom(root = document) {
-    if (!root || typeof root.querySelectorAll !== 'function') {
-      return 0;
-    }
-
-    const cards = root.querySelectorAll('article.woo-panel-main');
     let removedCount = 0;
-
-    for (const card of cards) {
+    for (const card of Array.from(root?.querySelectorAll?.(FEED_CARD_SELECTOR) || [])) {
       if (!shouldRemoveCard(card)) {
         continue;
       }
 
       const target = findRemovalTarget(card);
-      if (!target || !target.isConnected) {
+      if (!target?.isConnected) {
         continue;
       }
 
-      logCardRemoval('dom', summarizeCard(card));
+      logRemoval('dom', {
+        preview: summarizeText(card.innerText || card.textContent || ''),
+      });
       target.remove();
       removedCount += 1;
     }
-
     return removedCount;
   }
 
-  function hasActiveFeedInteraction(root = document) {
-    if (!root || typeof root.querySelector !== 'function') {
-      return false;
-    }
+  function cleanFeed(root = document, win = window) {
+    const runtime = getWeiboRuntime(root, win);
+    const scrollerRuntime = getFeedScrollerRuntime(root, win);
+    const removedStatusIds = new Set();
 
-    if (root.querySelector(ACTIVE_FEED_INTERACTION_SELECTOR)) {
-      return true;
-    }
-
-    const activeElement = root.activeElement;
-    if (!activeElement || typeof activeElement.closest !== 'function') {
-      return false;
-    }
-
-    if (activeElement.closest(`${FEED_CARD_SELECTOR} textarea, ${FEED_CARD_SELECTOR} input:not([type="hidden"]), ${FEED_CARD_SELECTOR} [contenteditable="true"], ${FEED_CARD_SELECTOR} [role="textbox"]`)) {
-      return true;
-    }
-
-    return activeElement.getAttribute?.('aria-expanded') === 'true'
-      && Boolean(activeElement.closest(FEED_CARD_SELECTOR));
+    const runtimeRemoved = cleanFeedWithRuntime(runtime, removedStatusIds);
+    const scrollerRemoved = cleanFeedWithScrollerRuntime(scrollerRuntime, root, runtime, removedStatusIds, win);
+    const domRemoved = cleanFeedByDom(root);
+    return runtimeRemoved + scrollerRemoved + domRemoved;
   }
 
   function isFeedMutationNode(node) {
@@ -824,157 +861,60 @@
   }
 
   function hasRelevantFeedMutation(records = []) {
-    return Array.from(records).some((record) => {
-      if (!record) {
-        return false;
-      }
-
-      if (isFeedMutationNode(record.target)) {
-        return true;
-      }
-
-      if (Array.from(record.addedNodes || []).some(isFeedMutationNode)) {
-        return true;
-      }
-
-      if (Array.from(record.removedNodes || []).some(isFeedMutationNode)) {
-        return true;
-      }
-
-      return false;
-    });
+    return Array.from(records).some((record) => (
+      isFeedMutationNode(record.target)
+      || Array.from(record.addedNodes || []).some(isFeedMutationNode)
+      || Array.from(record.removedNodes || []).some(isFeedMutationNode)
+    ));
   }
 
-  function cleanFeed(root = document) {
-    const runtime = typeof window !== 'undefined' && typeof document !== 'undefined'
-      ? getWeiboRuntime(root, window)
-      : null;
-    const scrollerRuntime = typeof window !== 'undefined' && typeof document !== 'undefined'
-      ? getFeedScrollerRuntime(root, window)
-      : null;
-    const removedStatusIds = new Set();
-
-    const runtimeRemoved = cleanFeedWithRuntime(runtime, removedStatusIds);
-    const scrollerRemoved = cleanFeedWithScrollerRuntime(scrollerRuntime, root, typeof window !== 'undefined' ? window : null, removedStatusIds);
-    const domRemoved = cleanFeedByDom(root);
-
-    return runtimeRemoved + scrollerRemoved + domRemoved;
-  }
-
-  function startCleaner(
-    doc = document,
-    intervalMs = SCAN_INTERVAL_MS,
-    win = typeof window !== 'undefined' ? window : null,
-    cleaner = cleanFeed,
-    interactionRepairer = null,
-  ) {
-    if (!win || typeof win.setTimeout !== 'function') {
+  function startCleaner(doc = document, intervalMs = CLEAN_INTERVAL_MS, win = window, cleaner = cleanFeed) {
+    if (!doc || !win || typeof win.setTimeout !== 'function') {
       return null;
     }
 
-    let isInteractionActive = false;
-    let pendingClean = false;
-    let interactionIdleTimer = null;
-    let mutationSettleTimer = null;
+    let cleanTimer = null;
+    let lastInteractionAt = 0;
     const ObserverCtor = win.MutationObserver || (typeof MutationObserver !== 'undefined' ? MutationObserver : null);
-    const observerTarget = doc?.querySelector?.('#app') || doc?.body || doc?.documentElement || doc;
+    const observerTarget = doc.querySelector?.('#app') || doc.body || doc.documentElement;
+
+    const requestClean = () => {
+      if (cleanTimer && typeof win.clearTimeout === 'function') {
+        win.clearTimeout(cleanTimer);
+      }
+
+      cleanTimer = win.setTimeout(() => {
+        cleanTimer = null;
+        const now = typeof Date !== 'undefined' && typeof Date.now === 'function' ? Date.now() : 0;
+        if (now - lastInteractionAt < INTERACTION_IDLE_MS) {
+          requestClean();
+          return;
+        }
+        cleaner(doc, win);
+      }, MUTATION_DEBOUNCE_MS);
+    };
+
+    const markInteraction = () => {
+      lastInteractionAt = typeof Date !== 'undefined' && typeof Date.now === 'function' ? Date.now() : 0;
+    };
+
+    if (typeof win.addEventListener === 'function') {
+      win.addEventListener('wheel', markInteraction, { passive: true, capture: true });
+      win.addEventListener('scroll', markInteraction, { passive: true, capture: true });
+      win.addEventListener('pointerdown', markInteraction, { passive: true, capture: true });
+      win.addEventListener('touchstart', markInteraction, { passive: true, capture: true });
+    }
 
     const controller = {
       intervalId: null,
       observer: null,
     };
 
-    const runInteractionRepair = () => {
-      if (typeof interactionRepairer === 'function') {
-        return interactionRepairer(doc, win);
-      }
-
-      return repairDuplicateScrollerItems(getFeedScrollerRuntime(doc, win), win);
-    };
-
-    const runCleaner = () => {
-      if (hasActiveFeedInteraction(doc)) {
-        runInteractionRepair();
-        pendingClean = true;
-        markInteractionActive(INTERACTION_IDLE_DELAY_MS);
-        return;
-      }
-
-      pendingClean = false;
-      cleaner(doc);
-    };
-
-    const flushPendingClean = () => {
-      if (hasActiveFeedInteraction(doc)) {
-        runInteractionRepair();
-        interactionIdleTimer = null;
-        markInteractionActive(INTERACTION_IDLE_DELAY_MS);
-        return;
-      }
-
-      isInteractionActive = false;
-      interactionIdleTimer = null;
-
-      if (pendingClean) {
-        runCleaner();
-      }
-    };
-
-    const markInteractionActive = (delayMs) => {
-      if (typeof win.setTimeout !== 'function') {
-        return;
-      }
-
-      isInteractionActive = true;
-
-      if (interactionIdleTimer && typeof win.clearTimeout === 'function') {
-        win.clearTimeout(interactionIdleTimer);
-      }
-
-      interactionIdleTimer = win.setTimeout(flushPendingClean, delayMs);
-    };
-
-    const markScrollActive = () => {
-      markInteractionActive(SCROLL_IDLE_DELAY_MS);
-    };
-
-    const markPointerActive = () => {
-      markInteractionActive(INTERACTION_IDLE_DELAY_MS);
-    };
-
-    const requestClean = () => {
-      if (mutationSettleTimer && typeof win.clearTimeout === 'function') {
-        win.clearTimeout(mutationSettleTimer);
-      }
-
-      mutationSettleTimer = win.setTimeout(() => {
-        mutationSettleTimer = null;
-
-        if (isInteractionActive) {
-          runInteractionRepair();
-          pendingClean = true;
-          return;
-        }
-
-        runCleaner();
-      }, MUTATION_SETTLE_DELAY_MS);
-    };
-
-    if (typeof win.addEventListener === 'function') {
-      win.addEventListener('wheel', markScrollActive, { passive: true });
-      win.addEventListener('scroll', markScrollActive, { passive: true, capture: true });
-      win.addEventListener('pointerdown', markPointerActive, { passive: true, capture: true });
-      win.addEventListener('click', markPointerActive, { passive: true, capture: true });
-      win.addEventListener('touchstart', markPointerActive, { passive: true, capture: true });
-    }
-
     if (ObserverCtor && observerTarget) {
       controller.observer = new ObserverCtor((records) => {
-        if (!hasRelevantFeedMutation(records)) {
-          return;
+        if (hasRelevantFeedMutation(records)) {
+          requestClean();
         }
-
-        requestClean();
       });
 
       controller.observer.observe(observerTarget, {
@@ -982,58 +922,53 @@
         childList: true,
         characterData: true,
         attributes: true,
-        attributeFilter: ['title', 'aria-label', 'aria-expanded', 'aria-pressed', 'data-index'],
+        attributeFilter: ['title', 'aria-label', 'data-index'],
       });
     }
 
-    runCleaner();
-
-    if (!controller.observer && typeof win.setInterval === 'function' && intervalMs > 0) {
-      controller.intervalId = win.setInterval(() => {
-        if (isInteractionActive) {
-          pendingClean = true;
-          return;
-        }
-
-        runCleaner();
-      }, intervalMs);
+    cleaner(doc, win);
+    if (typeof win.setInterval === 'function' && intervalMs > 0) {
+      controller.intervalId = win.setInterval(() => cleaner(doc, win), intervalMs);
     }
 
     return controller;
   }
 
   const api = {
-    BLOCKED_LABELS,
-    SCAN_INTERVAL_MS,
-    MUTATION_SETTLE_DELAY_MS,
-    SCROLL_IDLE_DELAY_MS,
-    INTERACTION_IDLE_DELAY_MS,
-    hasActiveFeedInteraction,
+    BLOCKED_BADGES,
+    CLEAN_INTERVAL_MS,
+    MUTATION_DEBOUNCE_MS,
     normalizeText,
+    findBlockedBadge,
     shouldRemoveCardBySignals,
     collectCardSignals,
     shouldRemoveCard,
     getWeiboRuntime,
-    resolveCurrentGroupId,
+    collectFeedStatusLists,
     isBlockedStatus,
+    isFeedApiUrl,
+    hasAdPayloadHint,
+    sanitizeFeedJsonValue,
+    sanitizeFeedResponseText,
+    installFetchHook,
+    installXMLHttpRequestHook,
+    installResponseHooks,
+    getStatusId,
     findHideStatusMenu,
     getMenuBackKey,
-    getStatusId,
-    getPreferredActionlog,
-    removeStatusFromList,
+    cleanStatusArray,
     cleanFeedWithRuntime,
     getVisibleScrollerMetrics,
-    isUsableScrollerRuntime,
+    pickBestDynamicScroller,
     getFeedScrollerRuntime,
     getScrollerItemIndex,
-    collectScrollerItemProxies,
+    collectBadgeMatchedScrollerIndexes,
     repairScrollerItemSizes,
-    scheduleScrollerItemSizeRepair,
-    repairDuplicateScrollerItems,
     cleanFeedWithScrollerRuntime,
     findRemovalTarget,
     cleanFeedByDom,
     cleanFeed,
+    hasRelevantFeedMutation,
     startCleaner,
   };
 
@@ -1041,7 +976,10 @@
     module.exports = api;
   }
 
-  if (typeof window !== 'undefined' && typeof document !== 'undefined' && !window[START_FLAG]) {
-    window[START_FLAG] = startCleaner(document, SCAN_INTERVAL_MS);
+  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+    installResponseHooks(window);
+    if (!window[START_FLAG]) {
+      window[START_FLAG] = startCleaner(document, CLEAN_INTERVAL_MS, window);
+    }
   }
 })();
